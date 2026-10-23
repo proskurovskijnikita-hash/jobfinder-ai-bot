@@ -24,31 +24,29 @@ from telegram.ext import (
 
 OWNER_ID = 7960334158
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-
 FEED_URL = "https://happymonday.ua/jobs-feed.json?per_page=100"
 
 DATA_FILE = Path("bot_data.json")
 FREE_SEARCHES = 3
-PROMO_SEARCHES = 10
+BONUS_SEARCHES = 10
 RESULTS_LIMIT = 5
 
 
 # =========================
-# ХРАНЕНИЕ ДАННЫХ
+# ДАННЫЕ
 # =========================
 
 def load_data():
     if DATA_FILE.exists():
         try:
-            with DATA_FILE.open("r", encoding="utf-8") as file:
-                data = json.load(file)
-                if isinstance(data, dict):
-                    data.setdefault("users", {})
-                    data.setdefault("promos", {})
-                    return data
+            with DATA_FILE.open("r", encoding="utf-8") as f:
+                result = json.load(f)
+                if isinstance(result, dict):
+                    result.setdefault("users", {})
+                    result.setdefault("promos", {})
+                    return result
         except (OSError, json.JSONDecodeError):
             pass
-
     return {"users": {}, "promos": {}}
 
 
@@ -56,30 +54,26 @@ data = load_data()
 
 
 def save_data():
-    temp_file = DATA_FILE.with_suffix(".tmp")
-    with temp_file.open("w", encoding="utf-8") as file:
-        json.dump(data, file, ensure_ascii=False, indent=2)
-    temp_file.replace(DATA_FILE)
+    temporary = DATA_FILE.with_suffix(".tmp")
+    with temporary.open("w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    temporary.replace(DATA_FILE)
+
+
+def is_owner(user_id):
+    return int(user_id) == OWNER_ID
 
 
 def get_user(user_id):
     key = str(user_id)
-
     if key not in data["users"]:
-        data["users"][key] = {
-            "requests": 0,
-            "bonus": 0,
-        }
+        data["users"][key] = {"requests": 0, "bonus": 0}
         save_data()
-
     return data["users"][key]
 
 
-def is_owner(user_id):
-    return user_id == OWNER_ID
-
-
 def can_search(user_id):
+    # Владелец всегда может искать без ограничений.
     if is_owner(user_id):
         return True
 
@@ -88,6 +82,7 @@ def can_search(user_id):
 
 
 def use_search(user_id):
+    # Никогда не списываем поиски у владельца.
     if is_owner(user_id):
         return
 
@@ -102,7 +97,7 @@ def use_search(user_id):
 
 
 # =========================
-# ЗАГРУЗКА ВАКАНСИЙ
+# ВАКАНСИИ
 # =========================
 
 def download_vacancies():
@@ -111,27 +106,36 @@ def download_vacancies():
         headers={"User-Agent": "JobFinderAI/1.0"},
     )
 
-    with urllib.request.urlopen(request, timeout=20) as response:
+    with urllib.request.urlopen(request, timeout=25) as response:
         payload = json.loads(response.read().decode("utf-8"))
 
-    if isinstance(payload, dict):
-        jobs = payload.get("data", [])
-    elif isinstance(payload, list):
+    # Поддерживаем распространённые структуры JSON.
+    if isinstance(payload, list):
         jobs = payload
+    elif isinstance(payload, dict):
+        jobs = None
+
+        for key in ("jobs", "data", "results", "items", "vacancies"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                jobs = value
+                break
+
+        if jobs is None:
+            jobs = []
+
     else:
         jobs = []
 
-    if not isinstance(jobs, list):
-        return []
-
     return [
         job for job in jobs
-        if isinstance(job, dict) and job.get("title")
+        if isinstance(job, dict)
+        and (job.get("title") or job.get("name"))
     ]
 
 
 # =========================
-# ОБРАБОТКА ТЕКСТА
+# ТЕКСТ
 # =========================
 
 class TextExtractor(HTMLParser):
@@ -154,41 +158,57 @@ def clean_text(value):
         return " ".join(clean_text(item) for item in value)
 
     if isinstance(value, dict):
-        return " ".join(clean_text(item) for item in value.values())
+        return " ".join(
+            clean_text(item) for item in value.values()
+        )
 
-    text = str(value)
     parser = TextExtractor()
 
     try:
-        parser.feed(text)
-        text = parser.get_text()
+        parser.feed(str(value))
+        result = parser.get_text()
     except Exception:
-        pass
+        result = str(value)
 
-    text = html.unescape(text)
-    return re.sub(r"\s+", " ", text).strip()
+    return re.sub(r"\s+", " ", html.unescape(result)).strip()
+
+
+def get_title(job):
+    return clean_text(job.get("title") or job.get("name") or "Вакансия")
+
+
+def get_description(job):
+    return clean_text(
+        job.get("description")
+        or job.get("content")
+        or job.get("excerpt")
+        or ""
+    )
+
+
+def get_company(job):
+    company = job.get("company") or job.get("employer") or ""
+    return clean_text(company)
+
+
+def get_url(job):
+    for key in ("url", "link", "apply_url", "job_url"):
+        value = job.get(key)
+        if isinstance(value, str) and value.startswith("https://"):
+            return value
+    return ""
 
 
 def vacancy_text(job):
-    parts = [
-        job.get("title", ""),
-        job.get("description", ""),
-        job.get("company", ""),
-        job.get("job_type", []),
-        job.get("job_format", []),
-        job.get("job_level", []),
-        job.get("english_level", []),
-        job.get("cities", []),
-        job.get("categories", []),
-    ]
-
-    return clean_text(parts).lower()
+    return clean_text(job).lower()
 
 
 def find_matches(jobs, criteria):
     words = {
         word.lower()
-        for word in re.findall(r"[^\W_]+", criteria, flags=re.UNICODE)
+        for word in re.findall(
+            r"[^\W_]+", criteria, flags=re.UNICODE
+        )
         if len(word) > 1
     }
 
@@ -198,81 +218,54 @@ def find_matches(jobs, criteria):
     scored = []
 
     for job in jobs:
-        title = clean_text(job.get("title", "")).lower()
+        title = get_title(job).lower()
         text = vacancy_text(job)
 
-        score = sum(
-            3 if word in title else 1
-            for word in words
-            if word in text
-        )
+        score = 0
+        for word in words:
+            if word in text:
+                score += 3 if word in title else 1
 
         if score > 0:
             scored.append((score, job))
 
     scored.sort(key=lambda item: item[0], reverse=True)
-    return [job for _, job in scored[:RESULTS_LIMIT]]
+    return [job for score, job in scored[:RESULTS_LIMIT]]
 
-
-# =========================
-# ФОРМАТ ВАКАНСИИ
-# =========================
 
 def format_vacancy(job):
-    title = clean_text(job.get("title", "Вакансия"))
-    company = clean_text(job.get("company", {}))
-    cities = clean_text(job.get("cities", []))
-    formats = clean_text(job.get("job_format", []))
-    job_types = clean_text(job.get("job_type", []))
-    levels = clean_text(job.get("job_level", []))
-    description = clean_text(job.get("description", ""))
-    url = job.get("url", "")
-
-    salary_data = job.get("salary", {})
-    salary = ""
-
-    if isinstance(salary_data, dict):
-        minimum = salary_data.get("min", "")
-        maximum = salary_data.get("max", "")
-        currency = salary_data.get("currency", "")
-
-        if minimum and maximum:
-            salary = f"{minimum}–{maximum} {currency.upper()}"
-        elif minimum:
-            salary = f"от {minimum} {currency.upper()}"
-        elif maximum:
-            salary = f"до {maximum} {currency.upper()}"
+    title = get_title(job)
+    company = get_company(job)
+    description = get_description(job)
+    url = get_url(job)
 
     lines = [f"💼 {title}"]
 
     if company:
         lines.append(f"🏢 Компания: {company}")
-    if cities:
-        lines.append(f"📍 Место: {cities}")
-    if formats:
-        lines.append(f"🏠 Формат: {formats}")
-    if job_types:
-        lines.append(f"🕒 Занятость: {job_types}")
-    if levels:
-        lines.append(f"📊 Уровень: {levels}")
-    if salary:
-        lines.append(f"💰 Зарплата: {salary}")
+
+    for key, label in (
+        ("cities", "📍 Место"),
+        ("location", "📍 Место"),
+        ("job_format", "🏠 Формат"),
+        ("employment_type", "🕒 Занятость"),
+        ("salary", "💰 Зарплата"),
+    ):
+        value = clean_text(job.get(key))
+        if value:
+            lines.append(f"{label}: {value}")
 
     if description:
-        short_description = description[:700]
-        if len(description) > 700:
-            short_description += "…"
-        lines.append("")
-        lines.append(short_description)
+        lines.extend(["", description[:800]])
 
-    if isinstance(url, str) and url.startswith("https://"):
-        lines.extend(["", f"🔗 Откликнуться: {url}"])
+    if url:
+        lines.extend(["", f"🔗 Подробнее: {url}"])
 
-    return "\n".join(lines)
+    return "\n".join(lines)[:4000]
 
 
 # =========================
-# КОМАНДЫ БОТА
+# КОМАНДЫ
 # =========================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -280,70 +273,61 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     get_user(user_id)
 
     if is_owner(user_id):
-        limit_text = "Для тебя поиск без ограничений."
+        message = (
+            "👑 Ты администратор JobFinder AI.\n"
+            "Для тебя поиск без ограничений."
+        )
     else:
         user = get_user(user_id)
         remaining = max(0, FREE_SEARCHES - user["requests"])
-        limit_text = (
+        message = (
             f"Бесплатных поисков осталось: {remaining}.\n"
-            f"Дополнительные поиски можно получить по промокоду."
+            f"Бонусных поисков: {user['bonus']}."
         )
 
     await update.message.reply_text(
         "Привет! Я JobFinder AI — бот для поиска вакансий.\n\n"
-        "Напиши /search, чтобы найти работу по ключевым словам.\n"
-        "Напиши /help, чтобы увидеть команды.\n\n"
-        f"{limit_text}"
+        "/search — искать вакансии\n"
+        "/help — помощь\n"
+        "/redeem КОД — активировать промокод\n\n"
+        + message
     )
 
 
-async def help_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📌 Команды JobFinder AI\n\n"
-        "/start — запустить бота\n"
+        "📌 Команды:\n\n"
+        "/start — запуск\n"
         "/search — поиск вакансий\n"
         "/redeem КОД — активировать промокод\n"
         "/help — помощь\n\n"
-        "Введи /search, затем отправь должность или ключевые слова, "
-        "например: Python, маркетолог, дизайнер, удалённая работа."
+        "Администратор может создавать промокоды командой /addpromo."
     )
 
 
-async def search_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    get_user(user_id)
 
     if not can_search(user_id):
         await update.message.reply_text(
-            "Бесплатные поиски закончились.\n"
+            "Ты использовал 3 бесплатных поиска.\n"
+            "Подписка и оплата пока не подключены.\n"
             "Если у тебя есть промокод, введи /redeem КОД."
         )
         return
 
     context.user_data["awaiting_search"] = True
-
     await update.message.reply_text(
-        "🔎 Напиши должность или ключевые слова для поиска.\n"
+        "🔎 Напиши должность или ключевые слова.\n"
         "Например: Python, дизайнер, маркетолог, удалённая работа."
     )
 
 
-async def redeem_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def redeem_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
     if not context.args:
-        await update.message.reply_text(
-            "Использование: /redeem ТВОЙ_КОД"
-        )
+        await update.message.reply_text("Использование: /redeem КОД")
         return
 
     code = context.args[0].strip().upper()
@@ -359,24 +343,20 @@ async def redeem_command(
     promo["used_by"] = user_id
 
     user = get_user(user_id)
-    user["bonus"] += int(promo.get("searches", PROMO_SEARCHES))
-
+    user["bonus"] += int(promo.get("searches", BONUS_SEARCHES))
     save_data()
 
     await update.message.reply_text(
-        f"✅ Промокод активирован!\n"
-        f"Добавлено поисков: {promo.get('searches', PROMO_SEARCHES)}."
+        f"✅ Промокод активирован! Добавлено поисков: "
+        f"{promo.get('searches', BONUS_SEARCHES)}."
     )
 
 
-async def addpromo_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def addpromo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
     if not is_owner(user_id):
-        await update.message.reply_text("Эта команда доступна только владельцу.")
+        await update.message.reply_text("Команда доступна только администратору.")
         return
 
     if context.args:
@@ -387,36 +367,31 @@ async def addpromo_command(
 
     if not re.fullmatch(r"[A-Z0-9_-]{4,40}", code):
         await update.message.reply_text(
-            "Код должен содержать от 4 до 40 символов: "
-            "латинские буквы, цифры, _ или -."
+            "Код должен содержать от 4 до 40 латинских букв, цифр, _ или -."
         )
         return
 
     if code in data["promos"]:
-        await update.message.reply_text("Такой промокод уже существует.")
+        await update.message.reply_text("Такой код уже существует.")
         return
 
     data["promos"][code] = {
         "used": False,
-        "searches": PROMO_SEARCHES,
+        "searches": BONUS_SEARCHES,
     }
     save_data()
 
     await update.message.reply_text(
-        f"🎟 Промокод создан: {code}\n"
-        f"Он даёт {PROMO_SEARCHES} дополнительных поисков.\n"
-        "Передай код пользователю после подтверждения оплаты."
+        f"🎟 Создан промокод: {code}\n"
+        f"Он даёт {BONUS_SEARCHES} дополнительных поисков."
     )
 
 
 # =========================
-# ПОИСК ПО СООБЩЕНИЮ
+# ОБРАБОТКА ПОИСКА
 # =========================
 
-async def handle_message(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
 
@@ -425,55 +400,41 @@ async def handle_message(
 
     user_id = update.effective_user.id
     criteria = update.message.text.strip()
-
-    if not criteria:
-        await update.message.reply_text("Введи ключевые слова для поиска.")
-        return
+    context.user_data["awaiting_search"] = False
 
     if not can_search(user_id):
-        context.user_data["awaiting_search"] = False
         await update.message.reply_text(
             "Бесплатные поиски закончились. Используй /redeem КОД."
         )
         return
 
-    context.user_data["awaiting_search"] = False
-
-    status_message = await update.message.reply_text(
-        "⏳ Ищу вакансии. Подожди немного..."
-    )
+    status = await update.message.reply_text("⏳ Ищу вакансии...")
 
     try:
         jobs = download_vacancies()
-        matches = find_matches(jobs, criteria)
 
         if not jobs:
-            await status_message.edit_text(
-                "Не удалось получить вакансии с сайта. Попробуй позже."
+            await status.edit_text(
+                "Сайт не вернул вакансии в ожидаемом формате. "
+                "Попробуй позже."
+            )
+            return
+
+        matches = find_matches(jobs, criteria)
+
+        if not matches:
+            await status.edit_text(
+                f"По запросу «{criteria}» совпадений не найдено. "
+                "Попробуй другие ключевые слова."
             )
             return
 
         use_search(user_id)
 
-        if not matches:
-            await status_message.edit_text(
-                f"По запросу «{criteria}» совпадений не найдено.\n"
-                "Попробуй другую должность или ключевые слова."
-            )
-            return
-
-        await status_message.edit_text(
-            f"✅ Найдено вакансий: {len(matches)}\n"
-            f"Запрос: {criteria}"
-        )
+        await status.edit_text(f"✅ Найдено вакансий: {len(matches)}")
 
         for job in matches:
-            text = format_vacancy(job)
-
-            if len(text) > 4000:
-                text = text[:3990] + "…"
-
-            await update.message.reply_text(text)
+            await update.message.reply_text(format_vacancy(job))
 
         if not is_owner(user_id):
             user = get_user(user_id)
@@ -483,9 +444,10 @@ async def handle_message(
                 f"Бонусных поисков: {user['bonus']}."
             )
 
-    except Exception:
-        await status_message.edit_text(
-            "Произошла ошибка при поиске вакансий. Попробуй позже."
+    except Exception as error:
+        print(f"Ошибка поиска: {error}")
+        await status.edit_text(
+            "Ошибка при загрузке вакансий. Попробуй позже."
         )
 
 
@@ -496,26 +458,23 @@ async def handle_message(
 def main():
     if not BOT_TOKEN:
         raise RuntimeError(
-            "Не найден BOT_TOKEN. Добавь его в Secrets GitHub Actions."
+            "Не найден BOT_TOKEN в секретах GitHub Actions."
         )
 
-    application = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).build()
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("search", search_command))
-    application.add_handler(CommandHandler("redeem", redeem_command))
-    application.add_handler(CommandHandler("addpromo", addpromo_command))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("search", search_command))
+    app.add_handler(CommandHandler("redeem", redeem_command))
+    app.add_handler(CommandHandler("addpromo", addpromo_command))
 
-    application.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            handle_message,
-        )
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
     )
 
-    print("JobFinder AI запущен.")
-    application.run_polling()
+    print(f"JobFinder AI запущен. ID владельца: {OWNER_ID}")
+    app.run_polling()
 
 
 if __name__ == "__main__":
