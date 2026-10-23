@@ -20,7 +20,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 FEED_URL = "https://happymonday.ua/jobs-feed.json?per_page=100"
-
+OWNER_ID = 7960334158
 users = {}
 waiting_for_criteria = set()
 
