@@ -137,7 +137,7 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id, {"requests": 0, "criteria": ""}
     )
 
-    if user["requests"] >= 3:
+    if user_id != OWNER_ID and user["requests"] >= 3:
         await update.message.reply_text(
             "Ты использовал 3 бесплатных поиска. "
             "Подписка и оплата пока ещё не подключены.",
